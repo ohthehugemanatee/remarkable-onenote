@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   pull-requests: write
   contents: read
@@ -13,14 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Get PR diff
-        run: |
-          git fetch origin ${{ github.base_ref }}
-          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
-          echo "Diff size: $(wc -c < /tmp/pr.diff) bytes"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr diff ${{ github.event.pull_request.number }} > /tmp/pr.diff
 
       - name: Review with Claude
         env:
@@ -33,19 +34,23 @@ jobs:
           import json
           import os
           import subprocess
+          import sys
           import urllib.request
+          import urllib.error
 
           with open('/tmp/pr.diff') as f:
               diff = f.read()
 
           if not diff.strip():
               print('Empty diff, skipping review')
-              exit(0)
+              sys.exit(0)
 
           MAX_CHARS = 80000
-          truncated = len(diff) > MAX_CHARS
-          if truncated:
-              diff = diff[:MAX_CHARS]
+          truncated = False
+          if len(diff) > MAX_CHARS:
+              cut = diff.rfind('\n', 0, MAX_CHARS)
+              diff = diff[:cut if cut > 0 else MAX_CHARS]
+              truncated = True
 
           fence = '```'
           trunc_note = '\n\n*(diff truncated due to size)*' if truncated else ''
@@ -77,10 +82,33 @@ jobs:
                   'content-type': 'application/json',
               }
           )
-          with urllib.request.urlopen(req) as resp:
-              result = json.loads(resp.read())
 
-          review = result['content'][0]['text']
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  result = json.loads(resp.read())
+          except urllib.error.HTTPError as e:
+              print(f'API error {e.code}: {e.read().decode()}')
+              sys.exit(1)
+          except Exception as e:
+              print(f'Request failed: {e}')
+              sys.exit(1)
+
+          if result.get('type') == 'error':
+              print(f"API returned error: {result.get('error')}")
+              sys.exit(1)
+
+          text_blocks = [
+              b['text'] for b in result.get('content', [])
+              if isinstance(b, dict) and b.get('type') == 'text'
+          ]
+          if not text_blocks:
+              print('No text content in response')
+              sys.exit(1)
+
+          review = text_blocks[0]
+          if result.get('stop_reason') == 'max_tokens':
+              review += '\n\n*(review truncated: response hit token limit)*'
+
           body = '## AI Code Review\n\n' + review + '\n\n---\n*Automated review by Claude*'
 
           with open('/tmp/review.md', 'w') as f:

@@ -6,6 +6,10 @@ on:
     workflows: ["CI"]
     types: [completed]
 
+concurrency:
+  group: autofix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   pull-requests: write
@@ -20,7 +24,7 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           token: ${{ github.token }}
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Auto-fix with Claude
         env:

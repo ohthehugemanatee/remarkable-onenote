@@ -3,8 +3,11 @@
 Auto-fix CI failures using Claude.
 Triggered by workflow_run events. Reads failure logs, runs an agentic
 repair loop with Claude, commits any fixes, and posts a PR comment.
+
+Only runs on same-repo PRs (not forks), since it pushes commits back
+to the PR branch using the GITHUB_TOKEN.
 """
-import json, os, subprocess, urllib.request
+import json, os, subprocess, sys, urllib.request, urllib.error
 
 TOOLS = [
     {
@@ -18,7 +21,7 @@ TOOLS = [
     },
     {
         "name": "write_file",
-        "description": "Write or overwrite a file in the repository",
+        "description": "Write or overwrite a file in the repository. Cannot write to .github/ or use path traversal.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -30,7 +33,7 @@ TOOLS = [
     },
     {
         "name": "run_bash",
-        "description": "Run a bash command to inspect the repository (ls, find, grep, cat, etc.)",
+        "description": "Run a read-only bash command to inspect the repository (ls, find, grep, cat, linting tools, etc.).",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -38,6 +41,10 @@ TOOLS = [
         },
     },
 ]
+
+# Patterns that could exfiltrate secrets or make unintended network requests
+_BASH_BLOCKED = ("curl", "wget", "nc ", "ncat", "netcat", "/dev/tcp",
+                 "ANTHROPIC", "GH_TOKEN", "GITHUB_TOKEN", "SECRET")
 
 
 def claude(messages, system):
@@ -57,26 +64,45 @@ def claude(messages, system):
             "content-type": "application/json",
         },
     )
-    with urllib.request.urlopen(req) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"API error {e.code}: {e.read().decode()}")
 
 
 def use_tool(name, inp):
     if name == "read_file":
         try:
-            return open(inp["path"].lstrip("/")).read()
+            with open(inp["path"].lstrip("/")) as f:
+                return f.read()
         except Exception as e:
             return str(e)
+
     if name == "write_file":
-        p = inp["path"].lstrip("/")
-        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-        open(p, "w").write(inp["content"])
-        return f"wrote {p}"
+        path = inp["path"].lstrip("/")
+        if not path:
+            return "Error: empty path"
+        if ".." in path.split("/"):
+            return "Error: path traversal not allowed"
+        if path.startswith(".github/"):
+            return "Error: writes to .github/ are not permitted"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write(inp["content"])
+        return f"wrote {path}"
+
     if name == "run_bash":
-        r = subprocess.run(
-            inp["command"], shell=True, capture_output=True, text=True, timeout=60
-        )
-        return (r.stdout + r.stderr)[:8000]
+        cmd = inp["command"]
+        for blocked in _BASH_BLOCKED:
+            if blocked in cmd:
+                return f"Error: command contains blocked pattern '{blocked}'"
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            return (r.stdout + r.stderr)[:8000]
+        except subprocess.TimeoutExpired:
+            return "Error: command timed out after 60 seconds"
+
     return f"unknown tool: {name}"
 
 
@@ -92,17 +118,23 @@ def main():
         print("No PR associated with this run, skipping")
         return
 
-    pr_number = str(prs[0]["number"])
-    head_ref = prs[0]["head"]["ref"]
+    pr = prs[0]
+    pr_number = str(pr["number"])
+    head_ref = pr["head"]["ref"]
     head_sha = run["head_sha"]
     run_id = str(run["id"])
 
-    # Anti-loop: skip if the head commit was already an autofix
+    # Only process same-repo PRs — forks can't receive pushes via GITHUB_TOKEN
+    if pr["head"]["repo"]["full_name"] != repo:
+        print(f"Skipping fork PR from {pr['head']['repo']['full_name']}")
+        return
+
+    # Anti-loop: skip if head commit was already an autofix
     r = subprocess.run(
         ["gh", "api", f"repos/{repo}/commits/{head_sha}", "--jq", ".commit.message"],
         capture_output=True, text=True,
     )
-    if "[autofix]" in r.stdout:
+    if r.returncode == 0 and "[autofix]" in r.stdout:
         print("Head commit is already an autofix, skipping")
         return
 
@@ -112,16 +144,23 @@ def main():
         ["gh", "run", "view", run_id, "--log-failed", "--repo", repo],
         capture_output=True, text=True,
     )
-    logs = (r.stdout or r.stderr).strip()[:25000]
+    logs = r.stdout.strip() if r.returncode == 0 else r.stderr.strip()
     if not logs:
         print("No failure logs found, skipping")
         return
 
+    MAX_LOG = 25000
+    if len(logs) > MAX_LOG:
+        cut = logs.rfind("\n", 0, MAX_LOG)
+        logs = logs[:cut if cut > 0 else MAX_LOG] + "\n...(truncated)"
+
     # PR diff for context
-    r = subprocess.run(
-        ["gh", "pr", "diff", pr_number, "--repo", repo], capture_output=True, text=True
-    )
-    diff = r.stdout[:15000]
+    r = subprocess.run(["gh", "pr", "diff", pr_number, "--repo", repo], capture_output=True, text=True)
+    diff = r.stdout
+    MAX_DIFF = 15000
+    if len(diff) > MAX_DIFF:
+        cut = diff.rfind("\n", 0, MAX_DIFF)
+        diff = diff[:cut if cut > 0 else MAX_DIFF] + "\n...(truncated)"
 
     system = (
         "You are an automated CI repair bot. Fix CI failures with minimal, targeted changes. "
@@ -140,23 +179,29 @@ def main():
     explanation = ""
 
     for _ in range(15):
-        resp = claude(messages, system)
-        messages.append({"role": "assistant", "content": resp["content"]})
+        try:
+            resp = claude(messages, system)
+        except RuntimeError as e:
+            print(f"Claude API error: {e}")
+            break
 
-        if resp["stop_reason"] == "end_turn":
+        messages.append({"role": "assistant", "content": resp["content"]})
+        stop_reason = resp.get("stop_reason")
+
+        if stop_reason == "end_turn":
             for b in resp["content"]:
                 if isinstance(b, dict) and b.get("type") == "text":
                     explanation = b["text"]
             break
 
-        if resp["stop_reason"] == "tool_use":
+        if stop_reason == "tool_use":
             results = []
             for b in resp["content"]:
                 if not isinstance(b, dict) or b.get("type") != "tool_use":
                     continue
                 print(f"  [{b['name']}] {str(b['input'])[:120]}")
                 out = use_tool(b["name"], b["input"])
-                if b["name"] == "write_file":
+                if b["name"] == "write_file" and not str(out).startswith("Error"):
                     written.append(b["input"]["path"])
                 results.append({
                     "type": "tool_result",
@@ -164,6 +209,9 @@ def main():
                     "content": str(out),
                 })
             messages.append({"role": "user", "content": results})
+        else:
+            print(f"Stopping: unexpected stop_reason '{stop_reason}'")
+            break
 
     if not written:
         body = (
@@ -176,9 +224,7 @@ def main():
         subprocess.run(
             ["git", "config", "user.email", "claude-autofix@noreply.github.com"], check=True
         )
-        subprocess.run(
-            ["git", "add", "--"] + [p.lstrip("/") for p in written], check=True
-        )
+        subprocess.run(["git", "add", "--"] + [p.lstrip("/") for p in written], check=True)
         r = subprocess.run(
             ["git", "commit", "-m",
              f"fix: auto-fix CI failures [autofix]\n\n{explanation[:400]}"],
@@ -200,7 +246,8 @@ def main():
             f"{explanation}\n\n---\n*Automated by Claude*"
         )
 
-    open("/tmp/autofix-comment.md", "w").write(body)
+    with open("/tmp/autofix-comment.md", "w") as f:
+        f.write(body)
     subprocess.run(
         ["gh", "pr", "comment", pr_number,
          "--body-file", "/tmp/autofix-comment.md",
