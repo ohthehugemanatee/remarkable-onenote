@@ -1,0 +1,96 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          echo "Diff size: $(wc -c < /tmp/pr.diff) bytes"
+
+      - name: Review with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import subprocess
+          import urllib.request
+
+          with open('/tmp/pr.diff') as f:
+              diff = f.read()
+
+          if not diff.strip():
+              print('Empty diff, skipping review')
+              exit(0)
+
+          MAX_CHARS = 80000
+          truncated = len(diff) > MAX_CHARS
+          if truncated:
+              diff = diff[:MAX_CHARS]
+
+          fence = '```'
+          trunc_note = '\n\n*(diff truncated due to size)*' if truncated else ''
+          prompt = (
+              'Review this pull request focusing on:\n\n'
+              '1. **Security vulnerabilities** - Authentication, authorization, injection attacks, and similar\n'
+              '2. **Performance issues** - O(n²) algorithms, unnecessary queries, memory leaks, and similar\n'
+              '3. **Code quality** - DRY violations, unclear naming, missing error handling, and similar\n'
+              '4. **Test coverage** - Missing edge cases, insufficient assertions, and similar\n'
+              '5. **Documentation** - Outdated comments, missing API docs, and similar\n\n'
+              'Be concise. Only report actual issues, not style preferences.\n'
+              'Format: `[SEVERITY: HIGH/MEDIUM/LOW] Issue description`\n\n'
+              'Here is the pull request diff:\n\n'
+              + fence + 'diff\n' + diff + '\n' + fence + trunc_note
+          )
+
+          payload = json.dumps({
+              'model': 'claude-opus-4-7',
+              'max_tokens': 2048,
+              'messages': [{'role': 'user', 'content': prompt}]
+          }).encode()
+
+          req = urllib.request.Request(
+              'https://api.anthropic.com/v1/messages',
+              data=payload,
+              headers={
+                  'x-api-key': os.environ['ANTHROPIC_API_KEY'],
+                  'anthropic-version': '2023-06-01',
+                  'content-type': 'application/json',
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              result = json.loads(resp.read())
+
+          review = result['content'][0]['text']
+          body = '## AI Code Review\n\n' + review + '\n\n---\n*Automated review by Claude*'
+
+          with open('/tmp/review.md', 'w') as f:
+              f.write(body)
+
+          subprocess.run(
+              ['gh', 'pr', 'comment', os.environ['PR_NUMBER'],
+               '--body-file', '/tmp/review.md',
+               '--repo', os.environ['REPO']],
+              check=True
+          )
+          print('Review posted successfully')
+          PYEOF
