@@ -50,7 +50,7 @@ rmsync is **not** a reMarkable cloud replacement. The cloud-protocol layer is pr
 rmsync depends on exactly two surfaces of rmfakecloud:
 
 1. **Filesystem layout** of rmfakecloud's user store. Default location `/data/rmfakecloud/users/<uid>/`. Files of interest per document `<uuid>`:
-   - `<uuid>.metadata` (YAML) — title, type, parent, last modified, deleted flag, tags
+   - `<uuid>.metadata` (JSON) — title, type, parent, last modified, deleted flag, tags (see ADR-0007)
    - `<uuid>.content` (JSON) — page list, layer information, schema version
    - `<uuid>/<page-id>.rm` (binary, v6/v7) — stroke data per page
    - `<uuid>.pdf` / `<uuid>.epub` (binary, optional) — imported source files
